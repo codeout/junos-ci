@@ -1,0 +1,17 @@
+protocols {
+    bgp {
+        group ebgp-peers {
+            type external;
+            import [ foo bar ];
+            peer-as 65000;
+            neighbor 192.0.2.2 {
+                authentication-key "something";
+                family inet {
+                    unicast;
+                    multicast;
+                }
+                local-address 198.51.100.1;
+           }
+        }
+    }
+}
