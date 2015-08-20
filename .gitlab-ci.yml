@@ -1,0 +1,9 @@
+before_script:
+  - id
+  - pwd
+  - rbenv
+  - gem install bundler
+  - bundle install
+
+job:
+  script: "bundle exec rake"
