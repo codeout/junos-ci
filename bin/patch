@@ -1,0 +1,95 @@
+#!/usr/bin/env ruby
+
+require 'diffy'
+require 'junoser'
+require 'rugged'
+
+class Differ
+  def initialize(path, old_branch, new_branch)
+    @repository = Rugged::Repository.new(path)
+    @old_branch, @new_branch = branches(old_branch, new_branch)
+  end
+
+  def print_set_statements
+    diff = @old_branch.target.diff(@new_branch.target)
+    diff.deltas.each do |delta|
+      puts diff_and_transform(delta.old_file, delta.new_file)
+    end
+  end
+
+
+  private
+
+  def exit_with_help
+    $stderr.puts "Usage: #$0 old_branch new_branch"
+    abort
+  end
+
+  def branches(old_branch, new_branch)
+    exit_with_help if !old_branch || !new_branch
+
+    [old_branch, new_branch].map{|b|
+      unless branch = @repository.branches[b]
+        $stderr.puts %[branch "#{branch}" doesn't exist]
+        abort
+      end
+
+      branch
+    }
+  end
+
+  def diff_and_transform(old_file, new_file)
+    old_path = loose?(old_file) ? '/dev/null' : old_file[:path]
+    new_path = loose?(new_file) ? '/dev/null' : new_file[:path]
+    diff = diff(old_file, new_file)
+
+    <<-EOS
+# #{old_path} -> #{new_path}
+
+#{diff}
+
+    EOS
+  end
+
+  def loose?(file)
+    file[:oid] =~ /^0+$/
+  end
+
+  def diff(old_file, new_file)
+    configs = {old: content(old_file), new: content(new_file)}
+
+    if configs.all? {|key, config|
+         juniper?(config) && configs[key] = Junoser::Cli.display_set(config)
+       }
+      replace(Diffy::Diff.new(configs[:old], configs[:new]).to_s)
+    else
+      Diffy::Diff.new(configs[:old], configs[:new]).to_s
+    end
+  end
+
+  def content(file)
+    unless loose?(file)
+      @repository.lookup(file[:oid]).content
+    else
+      ''
+    end
+  end
+
+  def juniper?(config)
+    case config
+    when '', /^version \S+;$/m
+      true
+    else
+      false
+    end
+  end
+
+  def replace(diff)
+    diff = diff.scan(/^[-+].*/).join("\n")
+    diff.gsub(/^\+set/, 'set').gsub(/^\-set/, 'delete')
+  end
+end
+
+
+differ = Differ.new('.', ARGV[0], ARGV[1])
+differ.print_set_statements
