@@ -2,6 +2,7 @@
 
 require 'diffy'
 require 'junoser'
+require 'parslet'
 require 'rugged'
 
 class Differ
@@ -13,7 +14,16 @@ class Differ
   def print_set_statements
     diff = @old_branch.target.diff(@new_branch.target)
     diff.deltas.each do |delta|
-      puts diff_and_transform(delta.old_file, delta.new_file)
+      old_path, new_path = file_paths(delta.old_file, delta.new_file)
+      puts "\n# #{old_path} -> #{new_path}\n\n"
+
+      new_config = content(delta.new_file)
+      if JunosFormatter.juniper?(new_config)
+        next unless Junoser::Cli.commit_check(new_config)
+        puts JunosFormatter.new.t(diff(delta.old_file, delta.new_file))
+      else
+        puts diff(delta.old_file, delta.new_file)
+      end
     end
   end
 
@@ -30,7 +40,7 @@ class Differ
 
     [old_branch, new_branch].map{|b|
       unless branch = @repository.branches[b]
-        $stderr.puts %[branch "#{branch}" doesn't exist]
+        $stderr.puts %(branch "#{branch}" doesn't exist)
         abort
       end
 
@@ -38,17 +48,9 @@ class Differ
     }
   end
 
-  def diff_and_transform(old_file, new_file)
-    old_path = loose?(old_file) ? '/dev/null' : old_file[:path]
-    new_path = loose?(new_file) ? '/dev/null' : new_file[:path]
-    diff = diff(old_file, new_file)
-
-    <<-EOS
-# #{old_path} -> #{new_path}
-
-#{diff}
-
-    EOS
+  def file_paths(old_file, new_file)
+    [(loose?(old_file) ? '/dev/null' : old_file[:path]),
+     (loose?(new_file) ? '/dev/null' : new_file[:path])]
   end
 
   def loose?(file)
@@ -56,37 +58,147 @@ class Differ
   end
 
   def diff(old_file, new_file)
-    configs = {old: content(old_file), new: content(new_file)}
+    raw = Diffy::Diff.new(content(old_file), content(new_file)).to_s
 
-    if configs.all? {|key, config|
-         juniper?(config) && configs[key] = Junoser::Cli.display_set(config)
-       }
-      replace(Diffy::Diff.new(configs[:old], configs[:new]).to_s)
-    else
-      Diffy::Diff.new(configs[:old], configs[:new]).to_s
-    end
+    tree = DiffParser.new.parse(raw)
+    DiffPrinter.print(tree)
   end
 
   def content(file)
-    unless loose?(file)
-      @repository.lookup(file[:oid]).content
-    else
+    if loose?(file)
       ''
-    end
-  end
-
-  def juniper?(config)
-    case config
-    when '', /^version \S+;$/m
-      true
     else
-      false
+      @repository.lookup(file[:oid]).content
+    end
+  end
+end
+
+
+class DiffParser < Parslet::Parser
+  rule(:diff_mark) { match('[-+ ]').as(:mark) }
+  rule(:line) { match('\s').repeat.capture(:space) >> match('[^\n]').repeat }
+
+  def level(indent)
+    diff_mark >> (str(indent) >> line).as(:line) >> str("\n").maybe >>
+      dynamic {|s, c| level(indent + c.captures[:space] + ' ').repeat }.as(:child)
+  end
+
+  rule(:config) { level('').repeat }
+  root :config
+end
+
+
+class DiffPrinter
+  def self.print(array)
+    buffer = ''
+    array.each {|tree| self.new(buffer, tree).print }
+    buffer
+  end
+
+  def initialize(buffer, tree, offset='', parent_mark=' ')
+    @buffer = buffer
+    @tree = tree
+    @offset = offset
+    @parent_mark = parent_mark
+  end
+
+  def print
+    case @tree[:mark]
+    when '-'
+      @buffer << "-#{@offset}#{@tree[:line]}\n" unless  @parent_mark == '+'
+    when '+'
+      @buffer << "+#{@offset}#{@tree[:line]}\n"
+      @tree[:child].each {|tree| self.class.new(@buffer, tree, @offset, '+').print }
+    else
+      if @parent_mark == '+'
+        @buffer << "+#{@offset}#{@tree[:line]}\n"
+        @tree[:child].each {|tree| self.class.new(@buffer, tree, @offset, '+').print }
+      else
+        @buffer << " #{@offset}#{@tree[:line]}\n" if diff_in_children?
+        @tree[:child].each {|tree| self.class.new(@buffer, tree, @offset, @parent_mark).print }
+      end
     end
   end
 
-  def replace(diff)
-    diff = diff.scan(/^[-+].*/).join("\n")
-    diff.gsub(/^\+set/, 'set').gsub(/^\-set/, 'delete')
+  def diff_in_children?
+    @tree[:child].any? {|tree|
+      tree[:mark].match(/[-+]/) || self.class.new(nil, tree).diff_in_children?
+    }
+  end
+end
+
+
+class JunosFormatter
+  WIDTH = 4
+
+  class << self
+    def juniper?(config)
+      case config
+      when '', /^version \S+;$/m
+        true
+      else
+        false
+      end
+    end
+  end
+
+  def t(str)
+    buffer = ''
+    process(str) do |cmd, stack, str|
+      buffer << "#{cmd} #{stack.join(' ')} #{str}\n".gsub(/ +/, ' ')
+    end
+    buffer
+  end
+
+  def process(str, &block)
+    @stack = []
+
+    str.split("\n").each do |line|
+      next if line =~ /.## Last commit:/
+
+      case line
+      when /^-(?!.*})(\s*)(.*){/
+        pop_stack $1
+        yield :delete, @stack, $2.strip
+      when /^[+ ](?!.*})(\s*)(.*){/
+        pop_stack $1
+        @stack.push $2.strip
+
+      when /^-(\s*)((?!\[).*)\[(.*)\];/
+        pop_stack $1
+        $3.split("\s").each do |i|
+          yield :delete, @stack, "#{$2.strip} #{i}"
+        end
+      when /^\+(\s*)((?!\[).*)\[(.*)\];/
+        pop_stack $1
+        $3.split("\s").each do |i|
+          yield :set, @stack, "#{$2.strip} #{i}"
+        end
+
+      when /^-(\s*)(.*);/
+        pop_stack $1
+        yield :delete, @stack, $2.strip
+      when /^\+(\s*)(.*);/
+        pop_stack $1
+        yield :set, @stack, $2.strip
+
+      when /^[+-]\s*}\s*$/
+      when /^[+-]\s*$/
+      when /^[+-]{(master|slave)}/
+
+      else
+        raise %(ERROR: unknown statement: "#{line}")
+      end
+    end
+  end
+
+  def pop_stack(indent)
+    c = indent.size / WIDTH
+    if c < 1
+      @stack = []
+    else
+      @stack = @stack[0..c-1]
+    end
   end
 end
 
